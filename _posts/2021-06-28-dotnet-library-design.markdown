@@ -236,7 +236,7 @@ public interface IBackgroundTaskrBuilder
 }
 {% endhighlight %}[_Source link_](https://github.com/Haydabase/BackgroundTaskr/blob/2661be4f74424955f85c5b96a1c6849a250a76bd/Haydabase.BackgroundTaskr/IBackgroundTaskrBuilder.cs){:target="_blank"}{: .right}
 
-All we really need here is a reference to the `IServiceCollection` so we can add more registrations to it. If we had a more complicated library where we could add more than one instance of something (e.g. `HttpClient`) we’d likely also have a `Name` property here to indicate the instance the builder is related to.
+All we really need here is a reference to the `IServiceCollection` so we can add more registrations to it. If we had a more complicated library where we could add more than one instance of something (e.g. `HttpClient`) we’d likely also have a [`Name` property](https://github.com/aspnet/HttpClientFactory/blob/7c4f9479b4753a37c8b0669a883002e5e448cc94/src/Microsoft.Extensions.Http/DependencyInjection/IHttpClientBuilder.cs#L16){:target="_blank"} here to indicate the instance the builder is related to.
 Note that we also do not define any methods on this interface, instead all builder functionality will be provided through extension methods. Since adding a method to an interface would be a compile time break, using extension methods here allows us to add more functionality in future without a breaking change.
 
 So we define a few extension methods to allow registering middlewares as such:
@@ -438,7 +438,7 @@ public static IBackgroundTaskrBuilder AddBackgroundTaskr(this IServiceCollection
    services.AddBackgroundTaskr(_ => { });
 {% endhighlight %}[_Source link_](https://github.com/Haydabase/BackgroundTaskr/blob/5ffdf4d3831f9efb4b9911bd1253c5831051cca8/Haydabase.BackgroundTaskr/BackgroundTaskrServiceCollectionExtensions.cs){:target="_blank"}{: .right}
 
-As with previous extnesions, we provide multiple overloads for convenience of consumers, respectively:
+As with previous extensions, we provide multiple overloads for convenience of consumers, respectively:
 - one to allow resolving dependencies for the enrichment,
 - another simpler configuration action if no dependencies are required,
 - and finally leaving the original overload for if no configuration is desired.
@@ -563,9 +563,88 @@ Where possible, we should provide a mechanism to opt-in to new/different behavio
 - Add a boolean flag to our `BackgroundTaskrOptions` class to control if the retry behaviour is enabled (`false` by default)
 - Add an `AddRetries` method to our builder, which could have the same effect, but with its own options for configuring numbers of attempts, back-off policies etc. It could even simply add a middleware which implements the retries.
 
+## Test Package
+[_Section commit_](https://github.com/Haydabase/BackgroundTaskr/commit/bd122a4d79d8bdee82cba7d133afddffec5438fa){:target="_blank"}{: .right}
+
+Coming full circle to when we first started designing our library, we [mentioned facilitating unit testing](#usage-interface) as a reason for exposing our libraries functionality through an interface. Doing so enables our consumers to mock-out (or implement themselves) the interface in unit tests. Sometimes simulating the functionality of a library interface is not straightforward, so it is worth considering providing test implementations, in order to ease the testing setup burden for our consumers.
+
+When thinking about a test implementation, it helps to have example code that uses our library, that we can try writing tests for. This helps us think about what we'd want from a consumer's point of view, in order to easily test classes that use our library's interfaces.
+
+In the case of our library, a consumer would likely want an easy way to:
+- setup the dependencies to be resolved from an `IServiceProvider` when running tasks,
+- determine if tasks have run to completion, or failed.
+So we'll create a test implementation of `IBackgroundTaskr` that can take care of these concerns.
+
+Addressing the first concern, our test implementation could provide a constructor that allows registering dependencies with an `IServiceCollection`. This could look something like:
+{% highlight csharp %}
+public SynchronousBackgroundTaskr(Action<IServiceCollection> registerServices)
+{
+    var services = new ServiceCollection();
+    registerServices(services);
+    _serviceProvider = services.BuildServiceProvider();
+}
+{% endhighlight %}[_Source link_](https://github.com/Haydabase/BackgroundTaskr/blob/bd122a4d79d8bdee82cba7d133afddffec5438fa/Haydabase.BackgroundTaskr.Testing/SynchronousBackgroundTaskr.cs#L23){:target="_blank"}{: .right}
+
+Now consumer test setup can be fairly concise, for example:
+{% highlight csharp %}
+var backgroundTaskr = new SynchronousBackgroundTaskr(
+    services => services
+        .AddScoped<IDelayer, FakeDelayer>()
+);
+{% endhighlight %}[_Source link_](https://github.com/Haydabase/BackgroundTaskr/blob/bd122a4d79d8bdee82cba7d133afddffec5438fa/DemoApp.UnitTests/Controllers/DemoControllerTests.cs#L16){:target="_blank"}{: .right}
+
+With regards to asserting on the running and outcome of the tasks, this is more complex when the tasks are run in the background, as we'd need a way to wait for them to finish. As may already be obvious from the above snippets, we can simplify this problem by running tasks synchronously in our test implementation. Consumers are unlikely to require the tasks actually run in the background for unit tests, since time consuming dependencies themselves can be mocked. If tasks run synchronously, we can simply add a list of invocations that can be checked at the end of a test run. So our test implementation will look something like this:
+{% highlight csharp %}
+void IBackgroundTaskr.CreateBackgroundTask(string name, Func<IServiceProvider, Task> runTask) =>
+    RunBackgroundTask(name, runTask).Wait();
+
+private async Task RunBackgroundTask(string name, Func<IServiceProvider, Task> runTask)
+{
+    try
+    {
+        using var scope = _serviceProvider.CreateScope();
+        await runTask(scope.ServiceProvider);
+    }
+    catch (Exception exception)
+    {
+        _invocations.Add(new Invocation(name, exception));
+        return;
+    }
+    _invocations.Add(new Invocation(name, null));
+}
+
+private readonly List<Invocation> _invocations = new List<Invocation>();
+
+public IReadOnlyList<Invocation> Invocations => _invocations.AsReadOnly();
+
+public class Invocation
+{
+    public Invocation(string taskName, Exception? exception)
+    {
+        TaskName = taskName;
+        Exception = exception;
+    }
+    public string TaskName { get; }
+    public Exception? Exception { get; }
+}
+{% endhighlight %}[_Source link_](https://github.com/Haydabase/BackgroundTaskr/blob/bd122a4d79d8bdee82cba7d133afddffec5438fa/Haydabase.BackgroundTaskr.Testing/SynchronousBackgroundTaskr.cs){:target="_blank"}{: .right}
+
+There are a couple of choices here to note:
+- We explicitly implement the `IBackgroundTaskr.CreateBackgroundTask` method, which prevents it being called without some additional effort in test code. The reason for doing so is to separate the methods/properties of the test implementation that are for testing (in this case the constructors + `Invocations`), for those intended to be called in production code via the public interface.
+- We do not allow the `_invocation` list to be modified outside the class, to ensure there is no way for it to be populated other than a task running.
+
+Now consumer test assertions can also be fairly concise, for example if using [FluentAssertions](https://fluentassertions.com/):
+{% highlight csharp %}
+var invocation = backgroundTaskr.Invocations.Should().ContainSingle().Subject;
+invocation.TaskName.Should().Be(name);
+invocation.Exception.Should().BeNull();
+{% endhighlight %}[_Source link_](https://github.com/Haydabase/BackgroundTaskr/blob/bd122a4d79d8bdee82cba7d133afddffec5438fa/DemoApp.UnitTests/Controllers/DemoControllerTests.cs#L28){:target="_blank"}{: .right}
+
+When publishing our test implementation, we should do so in a separate `BackgroundTaskr.Testing` NuGet package. As it is intended to only be consumed in test projects, we keep it separate to reduce the risk of accidental usage in production code.
+
 ## Summary
 
-We have seen how we can design a .NET library that is intuitive to configure, use, and extend, as well as easy to adopt and maintain by:
+We have seen how we can design a .NET library that is intuitive to configure, use, extend, and test, as well as easy to adopt and maintain by:
 
 - Ensuring it has a well defined raison d'être, and avoiding unnecessary dependencies
 - Designing with an open-source attitude, even if we may not be open-sourcing
@@ -576,7 +655,8 @@ We have seen how we can design a .NET library that is intuitive to configure, us
   - Builders
   - Options
 - Providing Observability out of the box with OpenTelemetry
-- Versioning with SemVer and avoiding breaking changes where practicable 
+- Versioning with SemVer and avoiding breaking changes where practicable
+- Providing a `*.Testing` package, where useful, to elevate some test complexities
 
 ### Further Reading
 
