@@ -157,21 +157,19 @@ We now have a basic version of our library coded up that we could publish, but r
 ## Extensibility
 
 Libraries often need to be extensible, allowing developers to tailor the behaviour to their specific use case. There are a couple of patterns in the .NET ecosystem that we can use to allow our libraries behaviour to be customized:
-- [Registration Builder](#registration-builder) - for example, adding extra or custom behaviours
-- [Configuration Options](#configuration-options) - for example, configuring settings or toggling features on/off, but also can be used to inject behaviour via funcs/actions
+- [Middleware](#middleware) - allowing custom code to be executed for all invocations of an operation, often configured using a...
+- [Registration Builder](#registration-builder) - for example, adding extra or custom behaviours,
+- [Configuration Options](#configuration-options) - for example, configuring settings or toggling features on/off, but also can be used to inject behaviour via funcs/actions.
 
 In practice, many libraries will use a combination of the above approaches, and so will we...
 
 ## Middleware
 [_Section commit_](https://github.com/Haydabase/BackgroundTaskr/commit/0f6fc745e0839054c3af90eebee4411b076d8925){:target="_blank"}{: .right}
 
-One of the most common .NET libraries with a rich builder interface is `HttpClient`. This allows for much configuration, including adding [outgoing request middleware](https://docs.microsoft.com/en-us/aspnet/core/fundamentals/http-requests?view=aspnetcore-5.0#outgoing-request-middleware) (`DelegatingHandler`):
-{% highlight csharp %}
-services.AddHttpClient("some-service")
-    .AddHttpMessageHandler<SomeMiddlewareHandler>();
-{% endhighlight %}
+Middleware is a powerful capability that allows any custom behaviour to wrap an operation, like a decorator. It is a concept that should be familiar to many developers, so we will adopt the same pattern in our library. Essentially we would need to call any middlewares in a pipeline around the running of background tasks: 
+![BackgroundTaskr Middleware](/assets/backgroundtaskr-middleware.png)
 
-We will use a similar approach in our library, allowing middlewares to be added around the running of background tasks. Firstly let’s define a middleware interface:
+Firstly let’s define a middleware interface, that is passed context about the current operation, and a `next` func to call the next part of the pipeline:
 {% highlight csharp %}
 public interface IBackgroundTaskrMiddleware
 {
@@ -179,7 +177,9 @@ public interface IBackgroundTaskrMiddleware
 }
 {% endhighlight %}[_Source link_](https://github.com/Haydabase/BackgroundTaskr/blob/0f6fc745e0839054c3af90eebee4411b076d8925/Haydabase.BackgroundTaskr/IBackgroundTaskrMiddleware.cs){:target="_blank"}{: .right}
 
-We will need to chain multiple middlewares together, so we will define a class to do so. Each middleware needs to be invoked with a next func which invokes the next middleware in the chain, or runs the background task if it is the innermost middleware. If we knew there were always 2 middleware, an implementation might look something like this:
+Note the only context info we have is the name of the task, but in general we'd expect more useful information to be made available in middleware. For example, if we had some state we passed to running tasks, we would make that available to inspect or modify in the middleware.
+
+We will need to chain multiple middlewares together, so we will define a class to do so. As illustrated above, each middleware needs to be invoked with a `next` func which invokes the next middleware in the chain, or runs the background task if it is the innermost middleware. If we knew there were always 2 middleware, an implementation might look something like this:
 {% highlight csharp %}
 internal sealed class MiddlewareInvoker : IMiddlewareInvoker
 {
